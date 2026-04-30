@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
-import packaging
+import packaging.version
 import websockets
 
 from unifi.core import RetryableError
