@@ -5,7 +5,10 @@ import sys
 from shutil import which
 
 import coloredlogs
-from pyunifiprotect import ProtectApiClient
+try:
+    from pyunifiprotect import ProtectApiClient
+except ImportError:
+    ProtectApiClient = None
 
 from unifi.cams import (
     DahuaCam,
@@ -135,6 +138,12 @@ def parse_args():
 
 
 async def generate_token(args, logger):
+    if ProtectApiClient is None:
+        logger.error(
+            "pyunifiprotect is not installed, cannot auto-generate token. "
+            "Please provide --token manually."
+        )
+        return None
     try:
         protect = ProtectApiClient(
             args.host, 443, args.nvr_username, args.nvr_password, verify_ssl=False
