@@ -45,6 +45,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
         self._stream_tasks: dict[str, str] = {}
         self._stream_modes: dict[str, str] = {}
+        self._pull_stream_name: Optional[str] = None
 
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
@@ -1015,8 +1016,9 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         Tier 1: pullStream via ms CLI + addStreamAlias
             Uses ms to pull RTSP directly (supports any codec including HEVC).
-            Creates an alias mapping the controller's streamName so that
-            Protect can find the stream for both live view and recording.
+            Only one pullStream is created per RTSP source to avoid
+            overloading cameras that limit concurrent connections.
+            Additional streams get aliases pointing to the same source.
         Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
             For Protect < 7.x (requires H.264 source for FLV compatibility)
         """
@@ -1028,7 +1030,9 @@ class UnifiCamBase(metaclass=ABCMeta):
         if stream_index in self._stream_tasks:
             # If controller assigned a new streamName, update the alias
             if self._stream_tasks.get(stream_index) != stream_name:
-                await self._try_add_stream_alias(local_name, stream_name)
+                await self._try_add_stream_alias(
+                    self._pull_stream_name, stream_name
+                )
                 self._stream_tasks[stream_index] = stream_name
             return
 
@@ -1045,7 +1049,22 @@ class UnifiCamBase(metaclass=ABCMeta):
         source = await self.get_stream_source(stream_index)
 
         # Tier 1: pullStream + addStreamAlias via ms CLI
+        # Only create one pullStream per source; additional streams
+        # just get an alias to the same localStreamName.
+        pull_name = self._pull_stream_name
+        if pull_name:
+            # pullStream already active, just add alias
+            await self._try_add_stream_alias(pull_name, stream_name)
+            self._stream_tasks[stream_index] = stream_name
+            self._stream_modes[stream_index] = "pull"
+            self.logger.info(
+                f"{stream_index}: reusing pullStream ({pull_name}), "
+                f"alias -> {stream_name}"
+            )
+            return
+
         if await self._try_pull_stream(source, local_name):
+            self._pull_stream_name = local_name
             await self._try_add_stream_alias(local_name, stream_name)
             self._stream_tasks[stream_index] = stream_name
             self._stream_modes[stream_index] = "pull"
@@ -1090,3 +1109,4 @@ class UnifiCamBase(metaclass=ABCMeta):
             self.stop_video_stream(stream)
         self._stream_tasks.clear()
         self._stream_modes.clear()
+        self._pull_stream_name = None
