@@ -1030,6 +1030,49 @@ class UnifiCamBase(metaclass=ABCMeta):
             )
         return False
 
+    def _detect_source_codec(self, source: str) -> Optional[str]:
+        """Detect video codec of RTSP source using ffprobe."""
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-rtsp_transport", self.args.rtsp_transport,
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "csv=p=0",
+                    source,
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            codec = result.stdout.strip().lower()
+            self.logger.info(f"Detected source codec: {codec}")
+            return codec if codec else None
+        except Exception as e:
+            self.logger.debug(f"ffprobe failed: {e}")
+            return None
+
+    def _get_ffmpeg_video_args(self, stream_index: str, source: str) -> str:
+        """Get ffmpeg video encoding args, transcoding HEVC to H.264 if needed.
+
+        FLV container does not support HEVC, so if the source is HEVC
+        we must transcode to H.264. Uses ultrafast preset with
+        zerolatency tune to minimize CPU usage and latency.
+        """
+        codec = self._detect_source_codec(source)
+
+        if codec and codec in ("hevc", "h265"):
+            self.logger.info(
+                f"Source is {codec}, transcoding to H.264 for FLV compatibility"
+            )
+            return (
+                "-c:v libx264 -preset ultrafast -tune zerolatency"
+                " -b:v 2000k -maxrate 2500k -bufsize 5000k"
+                " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
+            )
+
+        # H.264 or unknown - try copy first (standard behavior)
+        return self.get_extra_ffmpeg_args(stream_index)
+
     def _spawn_ffmpeg_pipeline(
         self,
         stream_index: str,
@@ -1038,13 +1081,23 @@ class UnifiCamBase(metaclass=ABCMeta):
         target_host: str,
         target_port: int,
         write_timestamps: bool = False,
+        transcode: bool = False,
     ):
-        """Spawn the ffmpeg + clock_sync + nc pipeline."""
+        """Spawn the ffmpeg + clock_sync + nc pipeline.
+
+        If transcode=True, auto-detects codec and transcodes HEVC to
+        H.264 since FLV does not support HEVC natively.
+        """
+        if transcode:
+            ffmpeg_args = self._get_ffmpeg_video_args(stream_index, source)
+        else:
+            ffmpeg_args = self.get_extra_ffmpeg_args(stream_index)
+
         cmd = (
             "ffmpeg -nostdin -loglevel error -y"
             f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
             f' {self.args.rtsp_transport} -i "{source}"'
-            f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
+            f" {ffmpeg_args} -metadata"
             f" streamName={stream_name} -f flv - | {sys.executable} -m"
             " unifi.clock_sync"
             f" {'--write-timestamps' if write_timestamps else ''}"
@@ -1060,109 +1113,31 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def start_video_stream(
         self, stream_index: str, stream_name: str, destination: tuple[str, int]
     ):
-        """Start video stream with two-tier fallback.
+        """Start video stream via FLV push to the controller's destination port.
 
-        Tier 1: pullStream + pushStream via ms CLI (single connection)
-            Uses ms to pull RTSP directly (supports any codec including HEVC).
-            Only one pullStream is created per RTSP source to avoid
-            overloading cameras that limit concurrent connections.
-            Then pushStream re-sends the stream to the controller's
-            destination port (e.g. 7550) so that Protect generates
-            the ONUBNT stream needed for live view.
-            Both commands are sent on one TCP connection since the ms
-            CLI only accepts one connection at a time.
-        Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
-            For Protect < 7.x (requires H.264 source for FLV compatibility)
+        The Protect controller expects to receive extendedFlv data on the
+        destination port (e.g. 7550). This creates INLFLV streams that
+        generate ONUBNT for live view.
+
+        If the source codec is HEVC (not supported by FLV container),
+        ffmpeg automatically transcodes to H.264 with ultrafast preset.
+        For H.264 sources, the video is passed through without transcoding.
+
+        The stream is processed through clock_sync to inject the required
+        onClockSync/onMpma metadata and timestamp trailers that the
+        Protect controller expects from real UniFi cameras.
         """
-        channel = {"video1": 0, "video2": 1, "video3": 2}.get(stream_index, 0)
-        mac_upper = self.args.mac.replace(":", "").upper()
-        local_name = f"{mac_upper}_{channel}"
-
-        # Skip if already active for this stream with same streamName
-        if stream_index in self._stream_tasks:
-            if self._stream_tasks.get(stream_index) != stream_name:
-                # Controller assigned a new streamName, push to new dest
-                pull_name = self._pull_stream_name
-                if pull_name:
-                    await self._try_push_stream(
-                        pull_name, destination[0], destination[1], stream_name
-                    )
-                self._stream_tasks[stream_index] = stream_name
-            return
-
-        # Skip if ffmpeg pipeline is already running
         has_spawned = stream_index in self._ffmpeg_handles
         is_dead = has_spawned and self._ffmpeg_handles[stream_index].poll() is not None
+
         if has_spawned and not is_dead:
             return
 
         if is_dead:
             self.logger.warn(f"Previous ffmpeg process for {stream_index} died.")
-            self._stream_modes.pop(stream_index, None)
 
         source = await self.get_stream_source(stream_index)
-        host, port = destination
 
-        # Tier 1: pullStream + pushStream via ms CLI
-        pull_name = self._pull_stream_name
-        if pull_name:
-            # Already have a pullStream, just pushStream to new destination
-            pushed = await self._try_push_stream(
-                pull_name, host, port, stream_name
-            )
-            if pushed:
-                self._stream_tasks[stream_index] = stream_name
-                self._stream_modes[stream_index] = "pull"
-                return
-        else:
-            # Send pullStream + pushStream in a single connection
-            pull_cmd = (
-                f"pullStream uri={source} localStreamName={local_name}"
-                f" forceTcp=1 keepAlive=1"
-            )
-            push_cmd = (
-                f"pushStream uri=tcp://{host}:{port}"
-                f" localStreamName={local_name}"
-                f" targetStreamName={stream_name}"
-                f" keepAlive=1"
-            )
-            results = await self._ms_cli_commands([pull_cmd, push_cmd])
-
-            pull_ok = results[0] and "SUCCESS" in results[0]
-            push_ok = results[1] and "SUCCESS" in results[1]
-
-            if pull_ok:
-                self._pull_stream_name = local_name
-                self.logger.info(
-                    f"{stream_index}: pullStream OK ({local_name})"
-                )
-            else:
-                self.logger.warning(
-                    f"{stream_index}: pullStream failed: "
-                    f"{results[0].strip() if results[0] else 'no response'}"
-                )
-
-            if push_ok:
-                self.logger.info(
-                    f"{stream_index}: pushStream OK -> "
-                    f"tcp://{host}:{port}/{stream_name}"
-                )
-                self._stream_tasks[stream_index] = stream_name
-                self._stream_modes[stream_index] = "pull"
-                return
-            elif pull_ok:
-                self.logger.warning(
-                    f"{stream_index}: pushStream failed: "
-                    f"{results[1].strip() if results[1] else 'no response'}"
-                )
-
-        # Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
-        self.logger.info(
-            f"{stream_index}: ms CLI unavailable, using legacy FLV push pipeline. "
-            "For Protect 7.x, set up SSH tunnel: "
-            f"ssh -L {self.args.ms_cli_port}:127.0.0.1:{self.args.ms_cli_port}"
-            " root@<NVR_IP>"
-        )
         self._spawn_ffmpeg_pipeline(
             stream_index,
             stream_name,
@@ -1170,8 +1145,8 @@ class UnifiCamBase(metaclass=ABCMeta):
             destination[0],
             destination[1],
             write_timestamps=self._needs_flv_timestamps,
+            transcode=True,
         )
-        self._stream_modes[stream_index] = "legacy"
 
     def stop_video_stream(self, stream_index: str):
         if stream_index in self._ffmpeg_handles:
