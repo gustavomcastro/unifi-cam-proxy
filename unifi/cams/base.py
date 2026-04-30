@@ -925,23 +925,38 @@ class UnifiCamBase(metaclass=ABCMeta):
         return " ".join(base_args)
 
     async def _ms_cli_command(self, command: str) -> Optional[str]:
-        """Send a command to the ms binary CLI and return the response."""
+        """Send a single command to the ms binary CLI."""
+        results = await self._ms_cli_commands([command])
+        return results[0] if results else None
+
+    async def _ms_cli_commands(self, commands: list[str]) -> list[Optional[str]]:
+        """Send multiple commands to the ms CLI in a single connection.
+
+        The ms binary only accepts one TCP connection at a time on port 1112,
+        so all commands must be sent sequentially on the same socket.
+        """
         host = self.args.ms_cli_host
         port = self.args.ms_cli_port
         loop = asyncio.get_event_loop()
 
         def _do_cli():
             sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-            sock.settimeout(5)
+            sock.settimeout(10)
+            results = []
             try:
                 sock.connect((host, port))
-                sock.sendall(f"{command}\n".encode())
-                time.sleep(2)
-                resp = sock.recv(4096).decode(errors="replace")
-                return resp
+                for cmd in commands:
+                    sock.sendall(f"{cmd}\n".encode())
+                    time.sleep(2)
+                    resp = sock.recv(16384).decode(errors="replace")
+                    results.append(resp)
+                return results
             except Exception as e:
                 self.logger.debug(f"ms CLI connection to {host}:{port} failed: {e}")
-                return None
+                # Pad remaining results with None
+                while len(results) < len(commands):
+                    results.append(None)
+                return results
             finally:
                 sock.close()
 
@@ -1047,13 +1062,15 @@ class UnifiCamBase(metaclass=ABCMeta):
     ):
         """Start video stream with two-tier fallback.
 
-        Tier 1: pullStream + pushStream via ms CLI
+        Tier 1: pullStream + pushStream via ms CLI (single connection)
             Uses ms to pull RTSP directly (supports any codec including HEVC).
             Only one pullStream is created per RTSP source to avoid
             overloading cameras that limit concurrent connections.
             Then pushStream re-sends the stream to the controller's
             destination port (e.g. 7550) so that Protect generates
             the ONUBNT stream needed for live view.
+            Both commands are sent on one TCP connection since the ms
+            CLI only accepts one connection at a time.
         Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
             For Protect < 7.x (requires H.264 source for FLV compatibility)
         """
@@ -1084,27 +1101,60 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._stream_modes.pop(stream_index, None)
 
         source = await self.get_stream_source(stream_index)
+        host, port = destination
 
         # Tier 1: pullStream + pushStream via ms CLI
-        # Pull RTSP once, then push to each destination the controller requests
         pull_name = self._pull_stream_name
-        if not pull_name:
-            if await self._try_pull_stream(source, local_name):
-                self._pull_stream_name = local_name
-                pull_name = local_name
-                self.logger.info(
-                    f"{stream_index}: pullStream OK ({local_name})"
-                )
-
         if pull_name:
-            # Push the pulled stream to the controller's destination port
+            # Already have a pullStream, just pushStream to new destination
             pushed = await self._try_push_stream(
-                pull_name, destination[0], destination[1], stream_name
+                pull_name, host, port, stream_name
             )
             if pushed:
                 self._stream_tasks[stream_index] = stream_name
                 self._stream_modes[stream_index] = "pull"
                 return
+        else:
+            # Send pullStream + pushStream in a single connection
+            pull_cmd = (
+                f"pullStream uri={source} localStreamName={local_name}"
+                f" forceTcp=1 keepAlive=1"
+            )
+            push_cmd = (
+                f"pushStream uri=tcp://{host}:{port}"
+                f" localStreamName={local_name}"
+                f" targetStreamName={stream_name}"
+                f" keepAlive=1"
+            )
+            results = await self._ms_cli_commands([pull_cmd, push_cmd])
+
+            pull_ok = results[0] and "SUCCESS" in results[0]
+            push_ok = results[1] and "SUCCESS" in results[1]
+
+            if pull_ok:
+                self._pull_stream_name = local_name
+                self.logger.info(
+                    f"{stream_index}: pullStream OK ({local_name})"
+                )
+            else:
+                self.logger.warning(
+                    f"{stream_index}: pullStream failed: "
+                    f"{results[0].strip() if results[0] else 'no response'}"
+                )
+
+            if push_ok:
+                self.logger.info(
+                    f"{stream_index}: pushStream OK -> "
+                    f"tcp://{host}:{port}/{stream_name}"
+                )
+                self._stream_tasks[stream_index] = stream_name
+                self._stream_modes[stream_index] = "pull"
+                return
+            elif pull_ok:
+                self.logger.warning(
+                    f"{stream_index}: pushStream failed: "
+                    f"{results[1].strip() if results[1] else 'no response'}"
+                )
 
         # Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
         self.logger.info(
