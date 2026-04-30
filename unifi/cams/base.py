@@ -43,7 +43,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
-        self._stream_tasks: dict[str, bool] = {}
+        self._stream_tasks: dict[str, str] = {}
         self._stream_modes: dict[str, str] = {}
 
         # Set up ssl context for requests
@@ -946,22 +946,6 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         return await loop.run_in_executor(None, _do_cli)
 
-    async def _try_create_ingest_point(self, local_name: str) -> bool:
-        """Pre-register a stream name via createIngestPoint on the ms CLI."""
-        cmd = (
-            f"createIngestPoint privateStreamName={local_name}"
-            f" publicStreamName={local_name}"
-        )
-        resp = await self._ms_cli_command(cmd)
-        if resp and "SUCCESS" in resp:
-            self.logger.info(f"createIngestPoint {local_name}: OK")
-            return True
-        if resp:
-            self.logger.warning(
-                f"createIngestPoint {local_name} failed: {resp.strip()}"
-            )
-        return False
-
     async def _try_pull_stream(self, source: str, local_name: str) -> bool:
         """Tell ms to pull an RTSP source directly via pullStream CLI."""
         cmd = (
@@ -974,6 +958,27 @@ class UnifiCamBase(metaclass=ABCMeta):
             return True
         if resp:
             self.logger.warning(f"pullStream {local_name} failed: {resp.strip()}")
+        return False
+
+    async def _try_add_stream_alias(
+        self, local_name: str, alias_name: str
+    ) -> bool:
+        """Create a stream alias so the controller can find the stream."""
+        cmd = (
+            f"addStreamAlias localStreamName={local_name}"
+            f" aliasName={alias_name} expirePeriod=0"
+        )
+        resp = await self._ms_cli_command(cmd)
+        if resp and "SUCCESS" in resp:
+            self.logger.info(
+                f"addStreamAlias {local_name} -> {alias_name}: OK"
+            )
+            return True
+        if resp:
+            self.logger.warning(
+                f"addStreamAlias {local_name} -> {alias_name} failed:"
+                f" {resp.strip()}"
+            )
         return False
 
     def _spawn_ffmpeg_pipeline(
@@ -1006,14 +1011,14 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def start_video_stream(
         self, stream_index: str, stream_name: str, destination: tuple[str, int]
     ):
-        """Start video stream with three-tier fallback.
+        """Start video stream with two-tier fallback.
 
-        Tier 1: createIngestPoint + FLV push to LiveFLV port (6666)
-            Creates INLFLV -> ONUBNT (live view) + ONFMP4 (recording)
-        Tier 2: pullStream via ms CLI
-            Creates INP -> ONFMP4 (recording only, no live view)
-        Tier 3: Legacy ffmpeg + clock_sync + nc pipeline
-            For Protect < 7.x
+        Tier 1: pullStream via ms CLI + addStreamAlias
+            Uses ms to pull RTSP directly (supports any codec including HEVC).
+            Creates an alias mapping the controller's streamName so that
+            Protect can find the stream for both live view and recording.
+        Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
+            For Protect < 7.x (requires H.264 source for FLV compatibility)
         """
         channel = {"video1": 0, "video2": 1, "video3": 2}.get(stream_index, 0)
         mac_upper = self.args.mac.replace(":", "").upper()
@@ -1021,6 +1026,10 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         # Skip if pullStream is already active for this stream
         if stream_index in self._stream_tasks:
+            # If controller assigned a new streamName, update the alias
+            if self._stream_tasks.get(stream_index) != stream_name:
+                await self._try_add_stream_alias(local_name, stream_name)
+                self._stream_tasks[stream_index] = stream_name
             return
 
         # Skip if ffmpeg pipeline is already running
@@ -1035,38 +1044,22 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         source = await self.get_stream_source(stream_index)
 
-        # Tier 1: createIngestPoint + FLV push to LiveFLV port
-        if await self._try_create_ingest_point(local_name):
-            self._spawn_ffmpeg_pipeline(
-                stream_index,
-                local_name,
-                source,
-                self.args.ms_cli_host,
-                self.args.liveflv_port,
-                write_timestamps=self._needs_flv_timestamps,
-            )
-            self._stream_modes[stream_index] = "ingest"
-            return
-
-        # Tier 2: pullStream via ms CLI (recording only)
+        # Tier 1: pullStream + addStreamAlias via ms CLI
         if await self._try_pull_stream(source, local_name):
-            self._stream_tasks[stream_index] = True
+            await self._try_add_stream_alias(local_name, stream_name)
+            self._stream_tasks[stream_index] = stream_name
             self._stream_modes[stream_index] = "pull"
             self.logger.info(
-                f"{stream_index}: using pullStream (recording only, no live view). "
-                "For live view, ensure LiveFLV port tunnel is available: "
-                f"ssh -L {self.args.liveflv_port}:127.0.0.1:{self.args.liveflv_port}"
-                f" -L {self.args.ms_cli_port}:127.0.0.1:{self.args.ms_cli_port}"
-                " root@<NVR_IP>"
+                f"{stream_index}: pullStream OK ({local_name}), "
+                f"alias -> {stream_name}"
             )
             return
 
-        # Tier 3: Legacy ffmpeg + clock_sync + nc pipeline
+        # Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
         self.logger.info(
             f"{stream_index}: ms CLI unavailable, using legacy FLV push pipeline. "
-            "For Protect 7.x, set up SSH tunnels: "
+            "For Protect 7.x, set up SSH tunnel: "
             f"ssh -L {self.args.ms_cli_port}:127.0.0.1:{self.args.ms_cli_port}"
-            f" -L {self.args.liveflv_port}:127.0.0.1:{self.args.liveflv_port}"
             " root@<NVR_IP>"
         )
         self._spawn_ffmpeg_pipeline(
