@@ -982,6 +982,39 @@ class UnifiCamBase(metaclass=ABCMeta):
             )
         return False
 
+    async def _try_push_stream(
+        self,
+        local_name: str,
+        target_host: str,
+        target_port: int,
+        target_stream_name: str,
+    ) -> bool:
+        """Push a local stream to a destination via the ms CLI.
+
+        This re-sends the pulled RTSP stream as FLV to the port that
+        the Protect controller is listening on (e.g. 7550), which is
+        required for live view (ONUBNT) generation.
+        """
+        cmd = (
+            f"pushStream uri=tcp://{target_host}:{target_port}"
+            f" localStreamName={local_name}"
+            f" targetStreamName={target_stream_name}"
+            f" keepAlive=1"
+        )
+        resp = await self._ms_cli_command(cmd)
+        if resp and "SUCCESS" in resp:
+            self.logger.info(
+                f"pushStream {local_name} -> "
+                f"tcp://{target_host}:{target_port}/{target_stream_name}: OK"
+            )
+            return True
+        if resp:
+            self.logger.warning(
+                f"pushStream {local_name} -> "
+                f"tcp://{target_host}:{target_port} failed: {resp.strip()}"
+            )
+        return False
+
     def _spawn_ffmpeg_pipeline(
         self,
         stream_index: str,
@@ -1014,11 +1047,13 @@ class UnifiCamBase(metaclass=ABCMeta):
     ):
         """Start video stream with two-tier fallback.
 
-        Tier 1: pullStream via ms CLI + addStreamAlias
+        Tier 1: pullStream + pushStream via ms CLI
             Uses ms to pull RTSP directly (supports any codec including HEVC).
             Only one pullStream is created per RTSP source to avoid
             overloading cameras that limit concurrent connections.
-            Additional streams get aliases pointing to the same source.
+            Then pushStream re-sends the stream to the controller's
+            destination port (e.g. 7550) so that Protect generates
+            the ONUBNT stream needed for live view.
         Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
             For Protect < 7.x (requires H.264 source for FLV compatibility)
         """
@@ -1026,13 +1061,15 @@ class UnifiCamBase(metaclass=ABCMeta):
         mac_upper = self.args.mac.replace(":", "").upper()
         local_name = f"{mac_upper}_{channel}"
 
-        # Skip if pullStream is already active for this stream
+        # Skip if already active for this stream with same streamName
         if stream_index in self._stream_tasks:
-            # If controller assigned a new streamName, update the alias
             if self._stream_tasks.get(stream_index) != stream_name:
-                await self._try_add_stream_alias(
-                    self._pull_stream_name, stream_name
-                )
+                # Controller assigned a new streamName, push to new dest
+                pull_name = self._pull_stream_name
+                if pull_name:
+                    await self._try_push_stream(
+                        pull_name, destination[0], destination[1], stream_name
+                    )
                 self._stream_tasks[stream_index] = stream_name
             return
 
@@ -1048,31 +1085,26 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         source = await self.get_stream_source(stream_index)
 
-        # Tier 1: pullStream + addStreamAlias via ms CLI
-        # Only create one pullStream per source; additional streams
-        # just get an alias to the same localStreamName.
+        # Tier 1: pullStream + pushStream via ms CLI
+        # Pull RTSP once, then push to each destination the controller requests
         pull_name = self._pull_stream_name
-        if pull_name:
-            # pullStream already active, just add alias
-            await self._try_add_stream_alias(pull_name, stream_name)
-            self._stream_tasks[stream_index] = stream_name
-            self._stream_modes[stream_index] = "pull"
-            self.logger.info(
-                f"{stream_index}: reusing pullStream ({pull_name}), "
-                f"alias -> {stream_name}"
-            )
-            return
+        if not pull_name:
+            if await self._try_pull_stream(source, local_name):
+                self._pull_stream_name = local_name
+                pull_name = local_name
+                self.logger.info(
+                    f"{stream_index}: pullStream OK ({local_name})"
+                )
 
-        if await self._try_pull_stream(source, local_name):
-            self._pull_stream_name = local_name
-            await self._try_add_stream_alias(local_name, stream_name)
-            self._stream_tasks[stream_index] = stream_name
-            self._stream_modes[stream_index] = "pull"
-            self.logger.info(
-                f"{stream_index}: pullStream OK ({local_name}), "
-                f"alias -> {stream_name}"
+        if pull_name:
+            # Push the pulled stream to the controller's destination port
+            pushed = await self._try_push_stream(
+                pull_name, destination[0], destination[1], stream_name
             )
-            return
+            if pushed:
+                self._stream_tasks[stream_index] = stream_name
+                self._stream_modes[stream_index] = "pull"
+                return
 
         # Tier 2: Legacy ffmpeg + clock_sync + nc pipeline
         self.logger.info(
