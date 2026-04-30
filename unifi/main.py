@@ -103,6 +103,23 @@ def parse_args():
         help="Firmware version to initiate connection with",
     )
     parser.add_argument(
+        "--ms-cli-host",
+        default="127.0.0.1",
+        help="Host for ms binary CLI (default: 127.0.0.1 for SSH tunnel)",
+    )
+    parser.add_argument(
+        "--ms-cli-port",
+        type=int,
+        default=1112,
+        help="Port for ms binary CLI (requires SSH tunnel to NVR)",
+    )
+    parser.add_argument(
+        "--liveflv-port",
+        type=int,
+        default=6666,
+        help="Port for LiveFLV ingest (requires SSH tunnel to NVR)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="increase output verbosity"
     )
 

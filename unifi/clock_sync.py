@@ -108,7 +108,8 @@ def main(args):
             write(packet_to_inject)
 
             # Write 15 byte trailer
-            write_timestamp_trailer(False, now - start)
+            if args.write_timestamps:
+                write_timestamp_trailer(False, now - start)
 
             # Write mpma tag
             # {'cs': {'cur': 1500000.0,
@@ -145,7 +146,8 @@ def main(args):
             write(packet_to_inject)
 
             # Write 15 byte trailer
-            write_timestamp_trailer(False, now - start)
+            if args.write_timestamps:
+                write_timestamp_trailer(False, now - start)
 
             # Write rest of original packet minus previous packet size
             write(header)
@@ -159,7 +161,8 @@ def main(args):
         write(read_bytes(source, 3))
 
         # Write 15 byte trailer
-        write_timestamp_trailer(packet_type == 9, now - start)
+        if args.write_timestamps:
+            write_timestamp_trailer(packet_type == 9, now - start)
 
         # Write mpma tag
         i += 1
